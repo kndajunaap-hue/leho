@@ -13,6 +13,8 @@ end
 
 local hasListFiles = (listfiles ~= nil)
 local BRIDGE_FILE = "autowalk_bridge.json"
+local REGISTRY_FILE = "autowalk_registry.json"
+local UI_STATE_FILE = "autowalk_ui_state.json"
 
 local REVERSE_MAPPING = {
     ["11"] = "Position",
@@ -69,6 +71,10 @@ local ui = {
     libraryItems = {}
 }
 
+local loadingUi = {}
+local CreateRounded
+local CreateStroke
+
 local function SafeCall(func, ...)
     local ok, result = pcall(func, ...)
     if not ok then
@@ -84,6 +90,131 @@ end
 local function Basename(path)
     local match = tostring(path or ""):match("([^\\/]+)$")
     return match or tostring(path or "")
+end
+
+local function ReadJsonFile(fileName)
+    if not fileName or not isfile(fileName) then
+        return nil
+    end
+
+    local ok, parsed = SafeCall(function()
+        return HttpService:JSONDecode(readfile(fileName))
+    end)
+    if ok and type(parsed) == "table" then
+        return parsed
+    end
+    return nil
+end
+
+local function WriteJsonFile(fileName, data)
+    if not fileName or type(data) ~= "table" then
+        return false
+    end
+
+    local ok = SafeCall(function()
+        writefile(fileName, HttpService:JSONEncode(data))
+    end)
+    return ok
+end
+
+local function PositionToTable(position)
+    return {
+        XScale = position.X.Scale,
+        XOffset = position.X.Offset,
+        YScale = position.Y.Scale,
+        YOffset = position.Y.Offset
+    }
+end
+
+local function TableToPosition(data, fallback)
+    if type(data) ~= "table" then
+        return fallback
+    end
+
+    return UDim2.new(
+        tonumber(data.XScale) or fallback.X.Scale,
+        tonumber(data.XOffset) or fallback.X.Offset,
+        tonumber(data.YScale) or fallback.Y.Scale,
+        tonumber(data.YOffset) or fallback.Y.Offset
+    )
+end
+
+local function GetRegistryItems()
+    local registry = ReadJsonFile(REGISTRY_FILE)
+    if registry and type(registry.Items) == "table" then
+        return registry.Items
+    end
+    return {}
+end
+
+local function GetLibraryEntries()
+    local entries = {}
+    local seen = {}
+
+    for _, item in ipairs(GetRegistryItems()) do
+        if type(item) == "table" and item.MergedFile and isfile(item.MergedFile) and not seen[item.MergedFile] then
+            seen[item.MergedFile] = true
+            table.insert(entries, item)
+        end
+    end
+
+    if #entries == 0 and hasListFiles then
+        local ok, list = SafeCall(function()
+            return listfiles(".")
+        end)
+        if ok and type(list) == "table" then
+            for _, fullPath in ipairs(list) do
+                local name = Basename(fullPath)
+                if name:match("^merged_.*%.json$") and not seen[name] then
+                    seen[name] = true
+                    table.insert(entries, {
+                        RecordingName = name:gsub("%.json$", ""),
+                        MountainName = name:gsub("^merged_", ""):gsub("_%d+$", ""),
+                        MergedFile = name,
+                        OwnerName = "-",
+                        OwnerDisplayName = "-",
+                        UpdatedAt = "-",
+                        FrameCount = 0
+                    })
+                end
+            end
+        end
+    end
+
+    table.sort(entries, function(a, b)
+        return tostring(a.UpdatedAt or a.MergedFile or "") > tostring(b.UpdatedAt or b.MergedFile or "")
+    end)
+
+    return entries
+end
+
+local function SaveUiState()
+    if not ui.mainFrame or not ui.quickPanel then
+        return
+    end
+
+    WriteJsonFile(UI_STATE_FILE, {
+        MainFrame = PositionToTable(ui.mainFrame.Position),
+        QuickPanel = PositionToTable(ui.quickPanel.Position),
+        MainVisible = ui.mainFrame.Visible
+    })
+end
+
+local function ApplySavedUiState()
+    if not ui.mainFrame or not ui.quickPanel then
+        return
+    end
+
+    local stateData = ReadJsonFile(UI_STATE_FILE)
+    if not stateData then
+        return
+    end
+
+    ui.mainFrame.Position = TableToPosition(stateData.MainFrame, ui.mainFrame.Position)
+    ui.quickPanel.Position = TableToPosition(stateData.QuickPanel, ui.quickPanel.Position)
+    if type(stateData.MainVisible) == "boolean" then
+        ui.mainFrame.Visible = stateData.MainVisible
+    end
 end
 
 local function DeobfuscateRecordingData(obfuscatedData)
@@ -118,6 +249,125 @@ local function SetStatus(text, color)
         ui.homeStatus.Text = text
         ui.homeStatus.TextColor3 = color or Theme.Text
     end
+    if ui.quickStatus then
+        ui.quickStatus.Text = text
+        ui.quickStatus.TextColor3 = color or Theme.Text
+    end
+end
+
+local function ShowLoadingScreen()
+    loadingUi.screen = Instance.new("ScreenGui")
+    loadingUi.screen.Name = "AutoWalkLoading"
+    loadingUi.screen.ResetOnSpawn = false
+    loadingUi.screen.Parent = player:WaitForChild("PlayerGui")
+
+    local overlay = Instance.new("Frame")
+    overlay.Size = UDim2.fromScale(1, 1)
+    overlay.BackgroundColor3 = Color3.fromRGB(236, 246, 255)
+    overlay.BorderSizePixel = 0
+    overlay.Parent = loadingUi.screen
+    loadingUi.overlay = overlay
+
+    local gradient = Instance.new("UIGradient")
+    gradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Theme.BgTop),
+        ColorSequenceKeypoint.new(1, Theme.BgBottom)
+    })
+    gradient.Rotation = 90
+    gradient.Parent = overlay
+
+    local card = Instance.new("Frame")
+    card.Size = UDim2.fromOffset(320, 150)
+    card.Position = UDim2.new(0.5, -160, 0.5, -75)
+    card.BackgroundColor3 = Theme.Surface
+    card.BorderSizePixel = 0
+    card.Parent = overlay
+    CreateRounded(card, 24)
+    CreateStroke(card, Theme.BorderStrong, 0.4, 1)
+    loadingUi.card = card
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -30, 0, 32)
+    title.Position = UDim2.fromOffset(15, 16)
+    title.BackgroundTransparency = 1
+    title.Text = "AutoWalk Studio"
+    title.TextColor3 = Theme.Text
+    title.Font = Enum.Font.GothamBlack
+    title.TextSize = 24
+    title.Parent = card
+
+    local sub = Instance.new("TextLabel")
+    sub.Size = UDim2.new(1, -30, 0, 20)
+    sub.Position = UDim2.fromOffset(15, 52)
+    sub.BackgroundTransparency = 1
+    sub.Text = "Menyiapkan data merge lokal..."
+    sub.TextColor3 = Theme.TextMuted
+    sub.Font = Enum.Font.Gotham
+    sub.TextSize = 12
+    sub.TextXAlignment = Enum.TextXAlignment.Left
+    sub.Parent = card
+    loadingUi.sub = sub
+
+    local barBack = Instance.new("Frame")
+    barBack.Size = UDim2.new(1, -30, 0, 12)
+    barBack.Position = UDim2.fromOffset(15, 94)
+    barBack.BackgroundColor3 = Theme.SurfaceSoft
+    barBack.BorderSizePixel = 0
+    barBack.Parent = card
+    CreateRounded(barBack, 999)
+
+    local barFill = Instance.new("Frame")
+    barFill.Size = UDim2.new(0, 0, 1, 0)
+    barFill.BackgroundColor3 = Theme.Primary
+    barFill.BorderSizePixel = 0
+    barFill.Parent = barBack
+    CreateRounded(barFill, 999)
+    loadingUi.barFill = barFill
+
+    local status = Instance.new("TextLabel")
+    status.Size = UDim2.new(1, -30, 0, 18)
+    status.Position = UDim2.fromOffset(15, 114)
+    status.BackgroundTransparency = 1
+    status.Text = "Loading..."
+    status.TextColor3 = Theme.TextMuted
+    status.Font = Enum.Font.GothamBold
+    status.TextSize = 11
+    status.TextXAlignment = Enum.TextXAlignment.Left
+    status.Parent = card
+    loadingUi.status = status
+end
+
+local function UpdateLoadingScreen(progress, text)
+    if loadingUi.barFill then
+        TweenService:Create(loadingUi.barFill, TweenInfo.new(0.2), {
+            Size = UDim2.new(math.clamp(progress, 0, 1), 0, 1, 0)
+        }):Play()
+    end
+    if loadingUi.status then
+        loadingUi.status.Text = text or "Loading..."
+    end
+end
+
+local function HideLoadingScreen()
+    if not loadingUi.screen or not loadingUi.overlay then
+        return
+    end
+
+    TweenService:Create(loadingUi.overlay, TweenInfo.new(0.35), {
+        BackgroundTransparency = 1
+    }):Play()
+    if loadingUi.card then
+        TweenService:Create(loadingUi.card, TweenInfo.new(0.35), {
+            BackgroundTransparency = 1
+        }):Play()
+    end
+
+    task.delay(0.4, function()
+        if loadingUi.screen then
+            loadingUi.screen:Destroy()
+            loadingUi = {}
+        end
+    end)
 end
 
 local function HasOwnerAccess()
@@ -191,14 +441,14 @@ local function RefreshOverview()
     end
 end
 
-local function CreateRounded(instance, radius)
+CreateRounded = function(instance, radius)
     local corner = Instance.new("UICorner")
     corner.CornerRadius = UDim.new(0, radius)
     corner.Parent = instance
     return corner
 end
 
-local function CreateStroke(instance, color, transparency, thickness)
+CreateStroke = function(instance, color, transparency, thickness)
     local stroke = Instance.new("UIStroke")
     stroke.Color = color
     stroke.Transparency = transparency or 0
@@ -320,25 +570,10 @@ local function LoadLatestBridge()
 end
 
 local function GetMergeFiles()
-    if not hasListFiles then
-        return {}
-    end
-
     local files = {}
-    local ok, list = SafeCall(function()
-        return listfiles(".")
-    end)
-    if not ok or type(list) ~= "table" then
-        return files
+    for _, entry in ipairs(GetLibraryEntries()) do
+        table.insert(files, entry.MergedFile)
     end
-
-    for _, fullPath in ipairs(list) do
-        local name = Basename(fullPath)
-        if name:match("^merged_.*%.json$") then
-            table.insert(files, name)
-        end
-    end
-
     table.sort(files, function(a, b)
         return a > b
     end)
@@ -359,10 +594,10 @@ local function RefreshLibrary()
 
     ui.libraryItems = {}
 
-    local files = GetMergeFiles()
+    local entries = GetLibraryEntries()
     local y = 0
 
-    if #files == 0 then
+    if #entries == 0 then
         local empty = Instance.new("Frame")
         empty.Size = UDim2.new(1, 0, 0, 56)
         empty.BackgroundColor3 = Theme.SurfaceAlt
@@ -374,7 +609,7 @@ local function RefreshLibrary()
         label.Size = UDim2.new(1, -16, 1, 0)
         label.Position = UDim2.fromOffset(8, 0)
         label.BackgroundTransparency = 1
-        label.Text = hasListFiles and "Belum ada file merge local." or "Executor ini tidak support listfiles."
+        label.Text = "Belum ada history merge yang tersimpan."
         label.TextColor3 = Theme.TextMuted
         label.Font = Enum.Font.Gotham
         label.TextSize = 12
@@ -385,9 +620,15 @@ local function RefreshLibrary()
         return
     end
 
-    for _, fileName in ipairs(files) do
+    for _, entry in ipairs(entries) do
+        local fileName = entry.MergedFile or "-"
+        local mountainName = Trim(entry.MountainName or "") ~= "" and entry.MountainName or fileName
+        local ownerText = Trim(entry.OwnerName or "") ~= "" and ("@" .. entry.OwnerName) or "owner tidak diketahui"
+        local frameText = tonumber(entry.FrameCount) and tostring(entry.FrameCount) or "0"
+        local updatedAt = entry.UpdatedAt or "-"
+
         local item = Instance.new("Frame")
-        item.Size = UDim2.new(1, 0, 0, 60)
+        item.Size = UDim2.new(1, 0, 0, 72)
         item.Position = UDim2.new(0, 0, 0, y)
         item.BackgroundColor3 = Theme.SurfaceAlt
         item.BorderSizePixel = 0
@@ -399,7 +640,7 @@ local function RefreshLibrary()
         nameLabel.Size = UDim2.new(1, -100, 0, 24)
         nameLabel.Position = UDim2.fromOffset(10, 8)
         nameLabel.BackgroundTransparency = 1
-        nameLabel.Text = fileName
+        nameLabel.Text = mountainName
         nameLabel.TextColor3 = Theme.Text
         nameLabel.Font = Enum.Font.GothamBold
         nameLabel.TextSize = 12
@@ -407,15 +648,26 @@ local function RefreshLibrary()
         nameLabel.Parent = item
 
         local hintLabel = Instance.new("TextLabel")
-        hintLabel.Size = UDim2.new(1, -100, 0, 18)
-        hintLabel.Position = UDim2.fromOffset(10, 32)
+        hintLabel.Size = UDim2.new(1, -100, 0, 16)
+        hintLabel.Position = UDim2.fromOffset(10, 30)
         hintLabel.BackgroundTransparency = 1
-        hintLabel.Text = "Klik Load untuk pakai hasil merge ini"
+        hintLabel.Text = string.format("%s | %s frame", ownerText, frameText)
         hintLabel.TextColor3 = Theme.TextMuted
         hintLabel.Font = Enum.Font.Gotham
         hintLabel.TextSize = 11
         hintLabel.TextXAlignment = Enum.TextXAlignment.Left
         hintLabel.Parent = item
+
+        local infoLabel = Instance.new("TextLabel")
+        infoLabel.Size = UDim2.new(1, -100, 0, 16)
+        infoLabel.Position = UDim2.fromOffset(10, 46)
+        infoLabel.BackgroundTransparency = 1
+        infoLabel.Text = string.format("%s | %s", fileName, updatedAt)
+        infoLabel.TextColor3 = Theme.TextMuted
+        infoLabel.Font = Enum.Font.Gotham
+        infoLabel.TextSize = 10
+        infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+        infoLabel.Parent = item
 
         local loadButton = CreateButton(item, "LOAD", UDim2.new(1, -74, 0, 15), UDim2.fromOffset(64, 30), Theme.Primary, Theme.PrimaryDark)
         loadButton.MouseButton1Click:Connect(function()
@@ -424,7 +676,7 @@ local function RefreshLibrary()
             SetCurrentPage("home")
         end)
 
-        y = y + 68
+        y = y + 80
     end
 
     ui.libraryList.CanvasSize = UDim2.new(0, 0, 0, y)
@@ -510,10 +762,13 @@ local function CreateUI()
     CreateRounded(floating, 17)
 
     ui.quickPanel = Instance.new("Frame")
-    ui.quickPanel.Size = UDim2.fromOffset(170, 44)
+    ui.quickPanel.Size = UDim2.fromOffset(206, 52)
     ui.quickPanel.Position = UDim2.new(0, 122, 0, 12)
     ui.quickPanel.BackgroundColor3 = Theme.Surface
+    ui.quickPanel.BackgroundTransparency = 0.12
     ui.quickPanel.BorderSizePixel = 0
+    ui.quickPanel.Active = true
+    ui.quickPanel.Draggable = true
     ui.quickPanel.Parent = ui.screenGui
     CreateRounded(ui.quickPanel, 20)
     CreateStroke(ui.quickPanel, Theme.BorderStrong, 0.35, 1)
@@ -526,8 +781,35 @@ local function CreateUI()
     quickGradient.Rotation = 0
     quickGradient.Parent = ui.quickPanel
 
-    local quickPlay = CreateButton(ui.quickPanel, "PLAY", UDim2.fromOffset(6, 6), UDim2.fromOffset(74, 32), Theme.Green, Theme.GreenDark)
-    local quickStop = CreateButton(ui.quickPanel, "STOP", UDim2.fromOffset(88, 6), UDim2.fromOffset(74, 32), Theme.Red, Theme.RedDark)
+    ui.quickStatus = Instance.new("TextLabel")
+    ui.quickStatus.Size = UDim2.fromOffset(74, 18)
+    ui.quickStatus.Position = UDim2.fromOffset(10, 4)
+    ui.quickStatus.BackgroundTransparency = 1
+    ui.quickStatus.Text = "READY"
+    ui.quickStatus.TextColor3 = Theme.Green
+    ui.quickStatus.Font = Enum.Font.GothamBold
+    ui.quickStatus.TextSize = 11
+    ui.quickStatus.TextXAlignment = Enum.TextXAlignment.Left
+    ui.quickStatus.Parent = ui.quickPanel
+
+    local quickHint = Instance.new("TextLabel")
+    quickHint.Size = UDim2.fromOffset(108, 16)
+    quickHint.Position = UDim2.fromOffset(88, 5)
+    quickHint.BackgroundTransparency = 1
+    quickHint.Text = "Drag panel ini"
+    quickHint.TextColor3 = Theme.TextMuted
+    quickHint.Font = Enum.Font.Gotham
+    quickHint.TextSize = 10
+    quickHint.TextXAlignment = Enum.TextXAlignment.Right
+    quickHint.Parent = ui.quickPanel
+
+    local quickPlay = CreateButton(ui.quickPanel, "PLAY", UDim2.fromOffset(8, 20), UDim2.fromOffset(90, 24), Theme.Green, Theme.GreenDark)
+    quickPlay.TextSize = 11
+    CreateRounded(quickPlay, 12)
+
+    local quickStop = CreateButton(ui.quickPanel, "STOP", UDim2.fromOffset(108, 20), UDim2.fromOffset(90, 24), Theme.Red, Theme.RedDark)
+    quickStop.TextSize = 11
+    CreateRounded(quickStop, 12)
 
     ui.mainFrame = Instance.new("Frame")
     ui.mainFrame.Size = UDim2.fromOffset(560, 365)
@@ -539,6 +821,8 @@ local function CreateUI()
     ui.mainFrame.Parent = ui.screenGui
     CreateRounded(ui.mainFrame, 24)
     CreateStroke(ui.mainFrame, Theme.BorderStrong, 0.45, 1)
+    ui.mainFrame:GetPropertyChangedSignal("Position"):Connect(SaveUiState)
+    ui.quickPanel:GetPropertyChangedSignal("Position"):Connect(SaveUiState)
 
     local backdrop = Instance.new("Frame")
     backdrop.Size = UDim2.new(1, 0, 1, 0)
@@ -905,6 +1189,7 @@ local function CreateUI()
     floating.MouseButton1Click:Connect(function()
         ui.mainFrame.Visible = not ui.mainFrame.Visible
         floating.Text = ui.mainFrame.Visible and "Hide UI" or "Show UI"
+        SaveUiState()
     end)
 
     loadLatest.MouseButton1Click:Connect(function()
@@ -938,10 +1223,19 @@ local function CreateUI()
         RefreshLibrary()
     end)
 
+    ApplySavedUiState()
+    ui.toggleButton.Text = ui.mainFrame.Visible and "Hide UI" or "Show UI"
 end
 
+ShowLoadingScreen()
+UpdateLoadingScreen(0.2, "Menyiapkan antarmuka...")
 CreateUI()
+UpdateLoadingScreen(0.5, "Memuat ringkasan...")
 RefreshOverview()
+UpdateLoadingScreen(0.72, "Membaca daftar merge permanen...")
 RefreshLibrary()
 SetCurrentPage("home")
+UpdateLoadingScreen(0.9, "Menghubungkan merge terakhir...")
 LoadLatestBridge()
+UpdateLoadingScreen(1, "Selesai")
+HideLoadingScreen()

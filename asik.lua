@@ -602,7 +602,7 @@ local function SaveAutoWalkScript(recordingName, mountainName, frames)
     return fileName
 end
 
-local function SaveAutoWalkBridge(recordingName, mountainName, mergedFile)
+local function SaveAutoWalkBridge(recordingName, mountainName, mergedFile, autoWalkFile, frameCount)
     if not hasFileSystem or not recordingName or not mergedFile then
         return false
     end
@@ -611,6 +611,8 @@ local function SaveAutoWalkBridge(recordingName, mountainName, mergedFile)
         RecordingName = recordingName,
         MountainName = mountainName,
         MergedFile = mergedFile,
+        AutoWalkFile = autoWalkFile,
+        FrameCount = frameCount or 0,
         OwnerUserId = player.UserId,
         OwnerName = player.Name,
         OwnerDisplayName = player.DisplayName,
@@ -618,6 +620,54 @@ local function SaveAutoWalkBridge(recordingName, mountainName, mergedFile)
     }
 
     writefile("autowalk_bridge.json", HttpService:JSONEncode(bridgeData))
+    return true
+end
+
+local function SaveMergeRegistry(recordingName, mountainName, mergedFile, autoWalkFile, frameCount)
+    if not hasFileSystem or not recordingName or not mergedFile then
+        return false
+    end
+
+    local registryFile = "autowalk_registry.json"
+    local registry = {Items = {}}
+
+    if isfile(registryFile) then
+        local ok, parsed = pcall(function()
+            return HttpService:JSONDecode(readfile(registryFile))
+        end)
+        if ok and type(parsed) == "table" then
+            registry = parsed
+            registry.Items = registry.Items or {}
+        end
+    end
+
+    local existingIndex = nil
+    for index, item in ipairs(registry.Items) do
+        if item.MergedFile == mergedFile then
+            existingIndex = index
+            break
+        end
+    end
+
+    local entry = {
+        RecordingName = recordingName,
+        MountainName = mountainName,
+        MergedFile = mergedFile,
+        AutoWalkFile = autoWalkFile,
+        FrameCount = frameCount or 0,
+        OwnerUserId = player.UserId,
+        OwnerName = player.Name,
+        OwnerDisplayName = player.DisplayName,
+        UpdatedAt = os.date("%Y-%m-%d %H:%M:%S")
+    }
+
+    if existingIndex then
+        registry.Items[existingIndex] = entry
+    else
+        table.insert(registry.Items, 1, entry)
+    end
+
+    writefile(registryFile, HttpService:JSONEncode(registry))
     return true
 end
 
@@ -1584,8 +1634,9 @@ local function CreateMergedReplay()
         }
 
         SaveRecordingToFile(mergedName, RecordingMeta[mergedName].SavedFile)
-        SaveAutoWalkBridge(mergedName, mountainName, RecordingMeta[mergedName].SavedFile)
         RecordingMeta[mergedName].AutoWalkFile = SaveAutoWalkScript(mergedName, mountainName, mergedFrames)
+        SaveAutoWalkBridge(mergedName, mountainName, RecordingMeta[mergedName].SavedFile, RecordingMeta[mergedName].AutoWalkFile, #mergedFrames)
+        SaveMergeRegistry(mergedName, mountainName, RecordingMeta[mergedName].SavedFile, RecordingMeta[mergedName].AutoWalkFile, #mergedFrames)
         UpdateRecordList()
         if MergeNameBox then
             MergeNameBox.Text = ""
