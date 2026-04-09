@@ -240,6 +240,68 @@ local function GetFrameCFrame(frame)
     return CFrame.lookAt(pos, pos + look, up)
 end
 
+local function GetFramePosition(frame)
+    return Vector3.new(frame.Position[1], frame.Position[2], frame.Position[3])
+end
+
+local function GetFrameLook(frame)
+    return Vector3.new(frame.LookVector[1], frame.LookVector[2], frame.LookVector[3])
+end
+
+local function GetFrameUp(frame)
+    return Vector3.new(frame.UpVector[1], frame.UpVector[2], frame.UpVector[3])
+end
+
+local function GetFrameVelocity(frame)
+    return Vector3.new(frame.Velocity[1], frame.Velocity[2], frame.Velocity[3])
+end
+
+local function BuildInterpolatedFrame(frameA, frameB, alpha)
+    if not frameA then
+        return frameB
+    end
+    if not frameB then
+        return frameA
+    end
+
+    alpha = math.clamp(alpha or 0, 0, 1)
+
+    local pos = GetFramePosition(frameA):Lerp(GetFramePosition(frameB), alpha)
+    local look = GetFrameLook(frameA):Lerp(GetFrameLook(frameB), alpha)
+    local up = GetFrameUp(frameA):Lerp(GetFrameUp(frameB), alpha)
+    local velocity = GetFrameVelocity(frameA):Lerp(GetFrameVelocity(frameB), alpha)
+
+    if look.Magnitude < 0.001 then
+        look = GetFrameLook(frameA)
+    else
+        look = look.Unit
+    end
+
+    if up.Magnitude < 0.001 then
+        up = GetFrameUp(frameA)
+    else
+        up = up.Unit
+    end
+
+    return {
+        Position = {pos.X, pos.Y, pos.Z},
+        LookVector = {look.X, look.Y, look.Z},
+        UpVector = {up.X, up.Y, up.Z},
+        Velocity = {velocity.X, velocity.Y, velocity.Z},
+        WalkSpeed = (frameA.WalkSpeed or 16) + (((frameB.WalkSpeed or 16) - (frameA.WalkSpeed or 16)) * alpha),
+        Timestamp = (frameA.Timestamp or 0) + (((frameB.Timestamp or 0) - (frameA.Timestamp or 0)) * alpha),
+        MoveState = frameA.MoveState or frameB.MoveState
+    }
+end
+
+local function ApplyPlaybackFrame(humanoid, hrp, frame)
+    humanoid.AutoRotate = false
+    humanoid.WalkSpeed = frame.WalkSpeed or 16
+    hrp.CFrame = GetFrameCFrame(frame)
+    hrp.AssemblyLinearVelocity = GetFrameVelocity(frame)
+    hrp.AssemblyAngularVelocity = Vector3.zero
+end
+
 local function SetStatus(text, color)
     if ui.statusChip then
         ui.statusChip.Text = text
@@ -739,11 +801,16 @@ local function PlayAutoWalk()
             return
         end
 
-        humanoid.AutoRotate = false
-        humanoid.WalkSpeed = frame.WalkSpeed or 16
-        hrp.CFrame = GetFrameCFrame(frame)
-        hrp.AssemblyLinearVelocity = Vector3.new(frame.Velocity[1], frame.Velocity[2], frame.Velocity[3])
-        hrp.AssemblyAngularVelocity = Vector3.zero
+        local nextFrame = state.frames[state.currentIndex + 1]
+        if nextFrame then
+            local currentTimestamp = frame.Timestamp or 0
+            local nextTimestamp = nextFrame.Timestamp or currentTimestamp
+            local duration = math.max(nextTimestamp - currentTimestamp, 0.0001)
+            local alpha = math.clamp((effectiveTime - currentTimestamp) / duration, 0, 1)
+            frame = BuildInterpolatedFrame(frame, nextFrame, alpha)
+        end
+
+        ApplyPlaybackFrame(humanoid, hrp, frame)
 
         if state.currentIndex >= #state.frames then
             StopAutoWalk()
