@@ -15,6 +15,9 @@ local hasListFiles = (listfiles ~= nil)
 local BRIDGE_FILE = "autowalk_bridge.json"
 local REGISTRY_FILE = "autowalk_registry.json"
 local UI_STATE_FILE = "autowalk_ui_state.json"
+local PLAYBACK_FIXED_TIMESTEP = 1 / 60
+local JUMP_VELOCITY_THRESHOLD = 10
+local STATE_CHANGE_COOLDOWN = 0.08
 
 local REVERSE_MAPPING = {
     ["11"] = "Position",
@@ -53,7 +56,12 @@ local state = {
     playbackSpeed = 1,
     currentIndex = 1,
     startTime = 0,
+    pausedTime = 0,
+    pausedIndex = 1,
     connection = nil,
+    playbackAccumulator = 0,
+    lastPlaybackState = nil,
+    lastStateChangeTime = 0,
     frames = {},
     recordingName = "-",
     mountainName = "-",
@@ -252,8 +260,12 @@ local function GetFrameUp(frame)
     return Vector3.new(frame.UpVector[1], frame.UpVector[2], frame.UpVector[3])
 end
 
-local function GetFrameVelocity(frame)
-    return Vector3.new(frame.Velocity[1], frame.Velocity[2], frame.Velocity[3])
+local function GetFrameVelocity(frame, moveState)
+    local velocity = Vector3.new(frame.Velocity[1], frame.Velocity[2], frame.Velocity[3])
+    if moveState == nil or moveState == "Grounded" then
+        return Vector3.new(velocity.X, 0, velocity.Z)
+    end
+    return velocity
 end
 
 local function BuildInterpolatedFrame(frameA, frameB, alpha)
@@ -269,7 +281,7 @@ local function BuildInterpolatedFrame(frameA, frameB, alpha)
     local pos = GetFramePosition(frameA):Lerp(GetFramePosition(frameB), alpha)
     local look = GetFrameLook(frameA):Lerp(GetFrameLook(frameB), alpha)
     local up = GetFrameUp(frameA):Lerp(GetFrameUp(frameB), alpha)
-    local velocity = GetFrameVelocity(frameA):Lerp(GetFrameVelocity(frameB), alpha)
+    local velocity = GetFrameVelocity(frameA, frameA.MoveState):Lerp(GetFrameVelocity(frameB, frameB.MoveState), alpha)
 
     if look.Magnitude < 0.001 then
         look = GetFrameLook(frameA)
@@ -295,10 +307,48 @@ local function BuildInterpolatedFrame(frameA, frameB, alpha)
 end
 
 local function ApplyPlaybackFrame(humanoid, hrp, frame)
+    local currentTime = tick()
+    local moveState = frame.MoveState or "Grounded"
+    local frameVelocity = GetFrameVelocity(frame, moveState)
+
+    if frameVelocity.Y > JUMP_VELOCITY_THRESHOLD and moveState ~= "Jumping" then
+        moveState = "Jumping"
+    elseif frameVelocity.Y < -5 and moveState ~= "Falling" then
+        moveState = "Falling"
+    end
+
     humanoid.AutoRotate = false
     humanoid.WalkSpeed = frame.WalkSpeed or 16
     hrp.CFrame = GetFrameCFrame(frame)
-    hrp.AssemblyLinearVelocity = GetFrameVelocity(frame)
+
+    if moveState == "Jumping" then
+        if state.lastPlaybackState ~= "Jumping" then
+            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+            state.lastPlaybackState = "Jumping"
+            state.lastStateChangeTime = currentTime
+        end
+    elseif moveState == "Falling" then
+        if state.lastPlaybackState ~= "Falling" then
+            humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+            state.lastPlaybackState = "Falling"
+            state.lastStateChangeTime = currentTime
+        end
+    else
+        if moveState ~= state.lastPlaybackState and (currentTime - state.lastStateChangeTime) >= STATE_CHANGE_COOLDOWN then
+            if moveState == "Climbing" then
+                humanoid:ChangeState(Enum.HumanoidStateType.Climbing)
+                humanoid.PlatformStand = false
+            elseif moveState == "Swimming" then
+                humanoid:ChangeState(Enum.HumanoidStateType.Swimming)
+            else
+                humanoid:ChangeState(Enum.HumanoidStateType.Running)
+            end
+            state.lastPlaybackState = moveState
+            state.lastStateChangeTime = currentTime
+        end
+    end
+
+    hrp.AssemblyLinearVelocity = GetFrameVelocity(frame, moveState)
     hrp.AssemblyAngularVelocity = Vector3.zero
 end
 
@@ -446,12 +496,22 @@ local function GetAccessText()
     return "AKSES DITOLAK", Theme.Red
 end
 
-local function StopAutoWalk()
+local function StopAutoWalk(clearResume)
+    if clearResume then
+        state.pausedIndex = 1
+        state.pausedTime = 0
+    elseif state.isPlaying and state.frames[state.currentIndex] then
+        state.pausedIndex = state.currentIndex
+        state.pausedTime = state.frames[state.currentIndex].Timestamp or 0
+    end
     state.isPlaying = false
     if state.connection then
         state.connection:Disconnect()
         state.connection = nil
     end
+    state.playbackAccumulator = 0
+    state.lastPlaybackState = nil
+    state.lastStateChangeTime = 0
     SetStatus("STOPPED", Theme.Red)
 end
 
@@ -602,6 +662,12 @@ local function LoadMergeDataFromFile(fileName)
     state.ownerUserId = meta and meta.OwnerUserId or nil
     state.ownerName = meta and meta.OwnerName or "-"
     state.ownerDisplayName = meta and meta.OwnerDisplayName or state.ownerName
+    state.currentIndex = 1
+    state.pausedIndex = 1
+    state.pausedTime = 0
+    state.playbackAccumulator = 0
+    state.lastPlaybackState = nil
+    state.lastStateChangeTime = 0
 
     RefreshOverview()
     SetStatus("READY", Theme.Green)
@@ -763,15 +829,27 @@ local function PlayAutoWalk()
     end
 
     state.isPlaying = true
-    state.currentIndex = 1
-    state.startTime = tick()
+    local resumeIndex = math.clamp(state.pausedIndex or 1, 1, #state.frames)
+    local resumeTime = math.max(state.pausedTime or 0, 0)
 
-    hrp.CFrame = GetFrameCFrame(state.frames[1])
+    if resumeIndex > #state.frames then
+        resumeIndex = 1
+        resumeTime = 0
+    end
+
+    state.currentIndex = resumeIndex
+    state.startTime = tick() - (resumeTime / state.playbackSpeed)
+    state.playbackAccumulator = 0
+    state.lastPlaybackState = nil
+    state.lastStateChangeTime = 0
+
+    local startFrame = state.frames[state.currentIndex] or state.frames[1]
+    hrp.CFrame = GetFrameCFrame(startFrame)
     hrp.AssemblyLinearVelocity = Vector3.zero
     hrp.AssemblyAngularVelocity = Vector3.zero
-    SetStatus("PLAYING", Theme.Green)
+    SetStatus(resumeTime > 0 and "RESUMED" or "PLAYING", Theme.Green)
 
-    state.connection = RunService.Heartbeat:Connect(function()
+    state.connection = RunService.Heartbeat:Connect(function(deltaTime)
         if not state.isPlaying then
             StopAutoWalk()
             return
@@ -790,30 +868,47 @@ local function PlayAutoWalk()
             return
         end
 
-        local effectiveTime = (tick() - state.startTime) * state.playbackSpeed
-        while state.currentIndex < #state.frames and (state.frames[state.currentIndex + 1].Timestamp or 0) <= effectiveTime do
-            state.currentIndex = state.currentIndex + 1
-        end
+        state.playbackAccumulator = state.playbackAccumulator + deltaTime
 
-        local frame = state.frames[state.currentIndex]
-        if not frame then
-            StopAutoWalk()
-            return
-        end
+        while state.playbackAccumulator >= PLAYBACK_FIXED_TIMESTEP do
+            state.playbackAccumulator = state.playbackAccumulator - PLAYBACK_FIXED_TIMESTEP
 
-        local nextFrame = state.frames[state.currentIndex + 1]
-        if nextFrame then
-            local currentTimestamp = frame.Timestamp or 0
-            local nextTimestamp = nextFrame.Timestamp or currentTimestamp
-            local duration = math.max(nextTimestamp - currentTimestamp, 0.0001)
-            local alpha = math.clamp((effectiveTime - currentTimestamp) / duration, 0, 1)
-            frame = BuildInterpolatedFrame(frame, nextFrame, alpha)
-        end
+            local effectiveTime = (tick() - state.startTime) * state.playbackSpeed
+            local nextIndex = state.currentIndex
+            while nextIndex < #state.frames and (state.frames[nextIndex + 1].Timestamp or 0) <= effectiveTime do
+                nextIndex = nextIndex + 1
+            end
 
-        ApplyPlaybackFrame(humanoid, hrp, frame)
+            if nextIndex > #state.frames then
+                StopAutoWalk()
+                return
+            end
 
-        if state.currentIndex >= #state.frames then
-            StopAutoWalk()
+            local baseFrame = state.frames[nextIndex]
+            if not baseFrame then
+                StopAutoWalk()
+                return
+            end
+
+            local frameToApply = baseFrame
+            local nextFrame = state.frames[nextIndex + 1]
+            if nextFrame then
+                local currentTimestamp = baseFrame.Timestamp or 0
+                local nextTimestamp = nextFrame.Timestamp or currentTimestamp
+                local duration = math.max(nextTimestamp - currentTimestamp, 0.0001)
+                local alpha = math.clamp((effectiveTime - currentTimestamp) / duration, 0, 1)
+                frameToApply = BuildInterpolatedFrame(baseFrame, nextFrame, alpha)
+            end
+
+            ApplyPlaybackFrame(humanoid, hrp, frameToApply)
+            state.currentIndex = nextIndex
+            state.pausedIndex = state.currentIndex
+            state.pausedTime = frameToApply.Timestamp or (baseFrame.Timestamp or 0)
+
+            if state.currentIndex >= #state.frames then
+                StopAutoWalk(true)
+                return
+            end
         end
     end)
 end
