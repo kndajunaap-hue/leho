@@ -18,8 +18,8 @@ local UI_STATE_FILE = "autowalk_ui_state.json"
 local PLAYBACK_FIXED_TIMESTEP = 1 / 60
 local JUMP_VELOCITY_THRESHOLD = 10
 local STATE_CHANGE_COOLDOWN = 0.08
-local VISUAL_SMOOTHING_ALPHA = 0.6
-local VELOCITY_SMOOTHING_ALPHA = 0.45
+local VISUAL_SMOOTHING_ALPHA = 0.72
+local VELOCITY_SMOOTHING_ALPHA = 0.8
 local SNAP_DISTANCE_THRESHOLD = 6
 local FOOTSTEP_MIN_SPEED = 1.5
 
@@ -88,6 +88,60 @@ local ui = {
 local loadingUi = {}
 local CreateRounded
 local CreateStroke
+local SetCurrentPage
+
+local function CreateMacWindowDots(parent, closeAction, hideAction, titleText)
+    local topBar = Instance.new("Frame")
+    topBar.Size = UDim2.new(1, -20, 0, 24)
+    topBar.Position = UDim2.fromOffset(10, 10)
+    topBar.BackgroundTransparency = 1
+    topBar.Parent = parent
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -110, 1, 0)
+    title.Position = UDim2.fromOffset(92, 0)
+    title.BackgroundTransparency = 1
+    title.Text = titleText or "AutoWalk Studio"
+    title.TextColor3 = Theme.TextMuted
+    title.Font = Enum.Font.GothamMedium
+    title.TextSize = 11
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = topBar
+
+    local dots = {
+        {Color = Color3.fromRGB(255, 95, 86), Hover = Color3.fromRGB(230, 74, 65), Action = closeAction},
+        {Color = Color3.fromRGB(255, 189, 46), Hover = Color3.fromRGB(232, 166, 22), Action = hideAction},
+        {Color = Color3.fromRGB(39, 201, 63), Hover = Color3.fromRGB(27, 177, 51), Action = function()
+            SetCurrentPage("home")
+        end}
+    }
+
+    for index, dot in ipairs(dots) do
+        local button = Instance.new("TextButton")
+        button.Size = UDim2.fromOffset(12, 12)
+        button.Position = UDim2.fromOffset((index - 1) * 18, 6)
+        button.BackgroundColor3 = dot.Color
+        button.Text = ""
+        button.AutoButtonColor = false
+        button.BorderSizePixel = 0
+        button.Parent = topBar
+        CreateRounded(button, 999)
+
+        button.MouseEnter:Connect(function()
+            TweenService:Create(button, TweenInfo.new(0.12), {BackgroundColor3 = dot.Hover}):Play()
+        end)
+
+        button.MouseLeave:Connect(function()
+            TweenService:Create(button, TweenInfo.new(0.12), {BackgroundColor3 = dot.Color}):Play()
+        end)
+
+        button.MouseButton1Click:Connect(function()
+            if dot.Action then
+                dot.Action()
+            end
+        end)
+    end
+end
 
 local function SafeCall(func, ...)
     local ok, result = pcall(func, ...)
@@ -447,18 +501,6 @@ local function ApplyPlaybackFrame(humanoid, hrp, frame)
         hrp.CFrame = hrp.CFrame:Lerp(targetCFrame, VISUAL_SMOOTHING_ALPHA)
     end
 
-    local horizontalVelocity = Vector3.new(frameVelocity.X, 0, frameVelocity.Z)
-    if horizontalVelocity.Magnitude > 0.05 then
-        humanoid:Move(horizontalVelocity.Unit, false)
-    else
-        local flatLook = Vector3.new(targetCFrame.LookVector.X, 0, targetCFrame.LookVector.Z)
-        if flatLook.Magnitude > 0.05 then
-            humanoid:Move(flatLook.Unit, false)
-        else
-            humanoid:Move(Vector3.zero, false)
-        end
-    end
-
     if moveState == "Jumping" then
         if state.lastPlaybackState ~= "Jumping" then
             humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
@@ -512,6 +554,7 @@ local function ShowLoadingScreen()
     loadingUi.screen.Name = "AutoWalkLoading"
     loadingUi.screen.ResetOnSpawn = false
     loadingUi.screen.Parent = player:WaitForChild("PlayerGui")
+    loadingUi.startedAt = tick()
 
     local overlay = Instance.new("Frame")
     overlay.Size = UDim2.fromScale(1, 1)
@@ -537,6 +580,7 @@ local function ShowLoadingScreen()
     CreateRounded(card, 24)
     CreateStroke(card, Theme.BorderStrong, 0.4, 1)
     loadingUi.card = card
+    CreateMacWindowDots(card, nil, nil, "Loading")
 
     local title = Instance.new("TextLabel")
     title.Size = UDim2.new(1, -30, 0, 32)
@@ -576,6 +620,43 @@ local function ShowLoadingScreen()
     CreateRounded(barFill, 999)
     loadingUi.barFill = barFill
 
+    local snakeLayer = Instance.new("Frame")
+    snakeLayer.Size = UDim2.new(1, 0, 1, 0)
+    snakeLayer.BackgroundTransparency = 1
+    snakeLayer.Parent = barBack
+    loadingUi.snakeSegments = {}
+
+    for i = 1, 5 do
+        local segment = Instance.new("Frame")
+        segment.Size = UDim2.fromOffset(8, 8)
+        segment.AnchorPoint = Vector2.new(0.5, 0.5)
+        segment.Position = UDim2.new(0, 0, 0.5, 0)
+        segment.BackgroundColor3 = i == 1 and Theme.PrimaryDark or Theme.Primary
+        segment.BorderSizePixel = 0
+        segment.Parent = snakeLayer
+        CreateRounded(segment, 999)
+        table.insert(loadingUi.snakeSegments, segment)
+    end
+
+    loadingUi.snakeConnection = RunService.RenderStepped:Connect(function()
+        if not loadingUi.snakeSegments or not barBack.Parent then
+            return
+        end
+
+        local width = barBack.AbsoluteSize.X
+        if width <= 0 then
+            return
+        end
+
+        local base = (tick() * 120) % (width + 60) - 30
+        for index, segment in ipairs(loadingUi.snakeSegments) do
+            local x = base - ((index - 1) * 12)
+            local y = math.sin((tick() * 6) - (index * 0.5)) * 1.5
+            segment.Position = UDim2.new(0, x, 0.5, y)
+            segment.BackgroundTransparency = math.clamp((index - 1) * 0.14, 0, 0.6)
+        end
+    end)
+
     local status = Instance.new("TextLabel")
     status.Size = UDim2.new(1, -30, 0, 18)
     status.Position = UDim2.fromOffset(15, 114)
@@ -603,6 +684,17 @@ end
 local function HideLoadingScreen()
     if not loadingUi.screen or not loadingUi.overlay then
         return
+    end
+
+    local minDuration = 1.8
+    local remaining = minDuration - (tick() - (loadingUi.startedAt or tick()))
+    if remaining > 0 then
+        task.wait(remaining)
+    end
+
+    if loadingUi.snakeConnection then
+        loadingUi.snakeConnection:Disconnect()
+        loadingUi.snakeConnection = nil
     end
 
     TweenService:Create(loadingUi.overlay, TweenInfo.new(0.35), {
@@ -764,7 +856,7 @@ local function CreateCard(parent, position, size)
     return card
 end
 
-local function SetCurrentPage(pageName)
+SetCurrentPage = function(pageName)
     state.currentPage = pageName
     for name, page in pairs(ui.pages) do
         page.Visible = (name == pageName)
@@ -1151,6 +1243,18 @@ local function CreateUI()
     CreateStroke(ui.mainFrame, Theme.BorderStrong, 0.45, 1)
     ui.mainFrame:GetPropertyChangedSignal("Position"):Connect(SaveUiState)
     ui.quickPanel:GetPropertyChangedSignal("Position"):Connect(SaveUiState)
+    CreateMacWindowDots(ui.mainFrame, function()
+        StopAutoWalk(true)
+        if ui.screenGui then
+            ui.screenGui:Destroy()
+        end
+    end, function()
+        ui.mainFrame.Visible = false
+        if ui.toggleButton then
+            ui.toggleButton.Text = "Show UI"
+        end
+        SaveUiState()
+    end, "AutoWalk Studio")
 
     local backdrop = Instance.new("Frame")
     backdrop.Size = UDim2.new(1, 0, 1, 0)
@@ -1181,7 +1285,7 @@ local function CreateUI()
 
     local brand = Instance.new("TextLabel")
     brand.Size = UDim2.new(1, -24, 0, 50)
-    brand.Position = UDim2.fromOffset(16, 18)
+    brand.Position = UDim2.fromOffset(16, 36)
     brand.BackgroundTransparency = 1
     brand.Text = "AutoWalk\nStudio"
     brand.TextColor3 = Theme.Text
@@ -1193,7 +1297,7 @@ local function CreateUI()
 
     ui.statusChip = Instance.new("TextLabel")
     ui.statusChip.Size = UDim2.new(1, -32, 0, 28)
-    ui.statusChip.Position = UDim2.fromOffset(16, 78)
+    ui.statusChip.Position = UDim2.fromOffset(16, 94)
     ui.statusChip.BackgroundColor3 = Theme.Surface
     ui.statusChip.Text = "READY"
     ui.statusChip.TextColor3 = Theme.Green
@@ -1206,7 +1310,7 @@ local function CreateUI()
 
     local navHolder = Instance.new("Frame")
     navHolder.Size = UDim2.new(1, -20, 0, 126)
-    navHolder.Position = UDim2.fromOffset(10, 122)
+    navHolder.Position = UDim2.fromOffset(10, 138)
     navHolder.BackgroundTransparency = 1
     navHolder.Parent = leftPanel
 
@@ -1230,7 +1334,7 @@ local function CreateUI()
 
     local footer = Instance.new("TextLabel")
     footer.Size = UDim2.new(1, -30, 0, 78)
-    footer.Position = UDim2.fromOffset(16, 268)
+    footer.Position = UDim2.fromOffset(16, 280)
     footer.BackgroundTransparency = 1
     footer.Text = "Bridge lokal dari asik.lua\nRaw GitHub hanya bawa script, bukan file merge lokal."
     footer.TextColor3 = Theme.TextMuted
