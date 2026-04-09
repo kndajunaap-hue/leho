@@ -18,6 +18,10 @@ local UI_STATE_FILE = "autowalk_ui_state.json"
 local PLAYBACK_FIXED_TIMESTEP = 1 / 60
 local JUMP_VELOCITY_THRESHOLD = 10
 local STATE_CHANGE_COOLDOWN = 0.08
+local VISUAL_SMOOTHING_ALPHA = 0.6
+local VELOCITY_SMOOTHING_ALPHA = 0.45
+local SNAP_DISTANCE_THRESHOLD = 6
+local FOOTSTEP_MIN_SPEED = 1.5
 
 local REVERSE_MAPPING = {
     ["11"] = "Position",
@@ -58,10 +62,12 @@ local state = {
     startTime = 0,
     pausedTime = 0,
     pausedIndex = 1,
+    pausedFrame = nil,
     connection = nil,
     playbackAccumulator = 0,
     lastPlaybackState = nil,
     lastStateChangeTime = 0,
+    lastAppliedFrame = nil,
     frames = {},
     recordingName = "-",
     mountainName = "-",
@@ -306,6 +312,104 @@ local function BuildInterpolatedFrame(frameA, frameB, alpha)
     }
 end
 
+local function FindFrameIndexByTimestamp(frames, targetTimestamp)
+    if not frames or #frames == 0 then
+        return 1
+    end
+
+    local bestIndex = 1
+    local bestDiff = math.huge
+    for index, frame in ipairs(frames) do
+        local diff = math.abs((frame.Timestamp or 0) - (targetTimestamp or 0))
+        if diff < bestDiff then
+            bestDiff = diff
+            bestIndex = index
+        end
+    end
+    return bestIndex
+end
+
+local function FindNearestFrameIndex(frames, position)
+    if not frames or #frames == 0 then
+        return 1
+    end
+
+    local bestIndex = 1
+    local bestDistance = math.huge
+    for index, frame in ipairs(frames) do
+        local distance = (GetFramePosition(frame) - position).Magnitude
+        if distance < bestDistance then
+            bestDistance = distance
+            bestIndex = index
+        end
+    end
+
+    return bestIndex, bestDistance
+end
+
+local function FindFootstepSound(character)
+    if not character then
+        return nil
+    end
+
+    for _, child in ipairs(character:GetDescendants()) do
+        if child:IsA("Sound") then
+            local lowerName = string.lower(child.Name)
+            if lowerName == "running" or lowerName == "run" or lowerName == "walk" or lowerName == "footsteps" then
+                return child
+            end
+        end
+    end
+
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        for _, child in ipairs(hrp:GetChildren()) do
+            if child:IsA("Sound") then
+                local lowerName = string.lower(child.Name)
+                if lowerName == "running" or lowerName == "run" or lowerName == "walk" or lowerName == "footsteps" then
+                    return child
+                end
+            end
+        end
+    end
+
+    for _, child in ipairs(character:GetDescendants()) do
+        if child:IsA("Sound") and child.SoundId ~= "" then
+            return child
+        end
+    end
+
+    return nil
+end
+
+local function StopFootstepSound(character)
+    local sound = FindFootstepSound(character)
+    if sound then
+        sound.Playing = false
+    end
+end
+
+local function UpdateFootstepSound(character, frame, moveState)
+    local sound = FindFootstepSound(character)
+    if not sound then
+        return
+    end
+
+    local velocity = GetFrameVelocity(frame, moveState)
+    local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+    local shouldPlay = (moveState == "Grounded" or moveState == "Running") and horizontalSpeed > FOOTSTEP_MIN_SPEED
+
+    if shouldPlay then
+        sound.Volume = math.clamp(0.2 + (horizontalSpeed / 28), 0.2, 0.9)
+        sound.PlaybackSpeed = math.clamp((frame.WalkSpeed or 16) / 16, 0.85, 1.5)
+        if not sound.Playing then
+            sound.Playing = true
+        end
+    else
+        sound.Playing = false
+    end
+end
+
 local function ApplyPlaybackFrame(humanoid, hrp, frame)
     local currentTime = tick()
     local moveState = frame.MoveState or "Grounded"
@@ -319,7 +423,41 @@ local function ApplyPlaybackFrame(humanoid, hrp, frame)
 
     humanoid.AutoRotate = false
     humanoid.WalkSpeed = frame.WalkSpeed or 16
-    hrp.CFrame = GetFrameCFrame(frame)
+    local targetCFrame = GetFrameCFrame(frame)
+    local targetPosition = targetCFrame.Position
+    local currentPosition = hrp.Position
+    local positionDistance = (currentPosition - targetPosition).Magnitude
+
+    if moveState == "Grounded" or moveState == "Running" then
+        local rayOrigin = targetPosition + Vector3.new(0, 3, 0)
+        local rayParams = RaycastParams.new()
+        rayParams.FilterType = Enum.RaycastFilterType.Exclude
+        rayParams.FilterDescendantsInstances = {humanoid.Parent}
+        local raycastResult = workspace:Raycast(rayOrigin, Vector3.new(0, -8, 0), rayParams)
+        if raycastResult then
+            local alignedY = raycastResult.Position.Y + (hrp.Size.Y * 0.5)
+            targetPosition = Vector3.new(targetPosition.X, alignedY, targetPosition.Z)
+            targetCFrame = CFrame.lookAt(targetPosition, targetPosition + Vector3.new(targetCFrame.LookVector.X, targetCFrame.LookVector.Y, targetCFrame.LookVector.Z), Vector3.new(targetCFrame.UpVector.X, targetCFrame.UpVector.Y, targetCFrame.UpVector.Z))
+        end
+    end
+
+    if positionDistance > SNAP_DISTANCE_THRESHOLD then
+        hrp.CFrame = targetCFrame
+    else
+        hrp.CFrame = hrp.CFrame:Lerp(targetCFrame, VISUAL_SMOOTHING_ALPHA)
+    end
+
+    local horizontalVelocity = Vector3.new(frameVelocity.X, 0, frameVelocity.Z)
+    if horizontalVelocity.Magnitude > 0.05 then
+        humanoid:Move(horizontalVelocity.Unit, false)
+    else
+        local flatLook = Vector3.new(targetCFrame.LookVector.X, 0, targetCFrame.LookVector.Z)
+        if flatLook.Magnitude > 0.05 then
+            humanoid:Move(flatLook.Unit, false)
+        else
+            humanoid:Move(Vector3.zero, false)
+        end
+    end
 
     if moveState == "Jumping" then
         if state.lastPlaybackState ~= "Jumping" then
@@ -348,8 +486,10 @@ local function ApplyPlaybackFrame(humanoid, hrp, frame)
         end
     end
 
-    hrp.AssemblyLinearVelocity = GetFrameVelocity(frame, moveState)
+    hrp.AssemblyLinearVelocity = hrp.AssemblyLinearVelocity:Lerp(GetFrameVelocity(frame, moveState), VELOCITY_SMOOTHING_ALPHA)
     hrp.AssemblyAngularVelocity = Vector3.zero
+    UpdateFootstepSound(humanoid.Parent, frame, moveState)
+    state.lastAppliedFrame = frame
 end
 
 local function SetStatus(text, color)
@@ -500,18 +640,25 @@ local function StopAutoWalk(clearResume)
     if clearResume then
         state.pausedIndex = 1
         state.pausedTime = 0
+        state.pausedFrame = nil
     elseif state.isPlaying and state.frames[state.currentIndex] then
-        state.pausedIndex = state.currentIndex
-        state.pausedTime = state.frames[state.currentIndex].Timestamp or 0
+        local resumeFrame = state.lastAppliedFrame or state.frames[state.currentIndex]
+        state.pausedTime = resumeFrame and (resumeFrame.Timestamp or 0) or 0
+        state.pausedIndex = FindFrameIndexByTimestamp(state.frames, state.pausedTime)
+        state.pausedFrame = resumeFrame
     end
     state.isPlaying = false
     if state.connection then
         state.connection:Disconnect()
         state.connection = nil
     end
+    if player.Character then
+        StopFootstepSound(player.Character)
+    end
     state.playbackAccumulator = 0
     state.lastPlaybackState = nil
     state.lastStateChangeTime = 0
+    state.lastAppliedFrame = nil
     SetStatus("STOPPED", Theme.Red)
 end
 
@@ -665,9 +812,11 @@ local function LoadMergeDataFromFile(fileName)
     state.currentIndex = 1
     state.pausedIndex = 1
     state.pausedTime = 0
+    state.pausedFrame = nil
     state.playbackAccumulator = 0
     state.lastPlaybackState = nil
     state.lastStateChangeTime = 0
+    state.lastAppliedFrame = nil
 
     RefreshOverview()
     SetStatus("READY", Theme.Green)
@@ -831,10 +980,25 @@ local function PlayAutoWalk()
     state.isPlaying = true
     local resumeIndex = math.clamp(state.pausedIndex or 1, 1, #state.frames)
     local resumeTime = math.max(state.pausedTime or 0, 0)
+    local resumeFrame = state.pausedFrame
+
+    if resumeFrame then
+        local currentDistance = (hrp.Position - GetFramePosition(resumeFrame)).Magnitude
+        if currentDistance > 18 then
+            local nearestIndex = FindNearestFrameIndex(state.frames, hrp.Position)
+            resumeIndex = nearestIndex
+            resumeFrame = nil
+            resumeTime = (state.frames[nearestIndex] and state.frames[nearestIndex].Timestamp) or 0
+            state.pausedIndex = resumeIndex
+            state.pausedTime = resumeTime
+            state.pausedFrame = nil
+        end
+    end
 
     if resumeIndex > #state.frames then
         resumeIndex = 1
         resumeTime = 0
+        resumeFrame = nil
     end
 
     state.currentIndex = resumeIndex
@@ -843,10 +1007,11 @@ local function PlayAutoWalk()
     state.lastPlaybackState = nil
     state.lastStateChangeTime = 0
 
-    local startFrame = state.frames[state.currentIndex] or state.frames[1]
+    local startFrame = resumeFrame or state.frames[state.currentIndex] or state.frames[1]
     hrp.CFrame = GetFrameCFrame(startFrame)
     hrp.AssemblyLinearVelocity = Vector3.zero
     hrp.AssemblyAngularVelocity = Vector3.zero
+    state.lastAppliedFrame = startFrame
     SetStatus(resumeTime > 0 and "RESUMED" or "PLAYING", Theme.Green)
 
     state.connection = RunService.Heartbeat:Connect(function(deltaTime)
@@ -904,6 +1069,7 @@ local function PlayAutoWalk()
             state.currentIndex = nextIndex
             state.pausedIndex = state.currentIndex
             state.pausedTime = frameToApply.Timestamp or (baseFrame.Timestamp or 0)
+            state.pausedFrame = frameToApply
 
             if state.currentIndex >= #state.frames then
                 StopAutoWalk(true)
